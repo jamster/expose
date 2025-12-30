@@ -62,6 +62,11 @@ interface State {
       started: string;
     };
   };
+  dashboard?: {
+    pid: number;
+    port: number;
+    started: string;
+  };
 }
 
 interface ParsedHostname {
@@ -1147,7 +1152,54 @@ function generateDashboardHTML(state: State): string {
 /**
  * Start the web dashboard
  */
-function startDashboard(port: number): void {
+function startDashboard(port: number, background: boolean): void {
+  const state = loadState();
+
+  // Check if dashboard is already running (skip if we ARE that process - for --foreground mode)
+  if (state.dashboard?.pid && state.dashboard.pid !== process.pid) {
+    try {
+      process.kill(state.dashboard.pid, 0); // Check if process exists
+      console.error(`Dashboard already running on http://localhost:${state.dashboard.port} (PID ${state.dashboard.pid})`);
+      console.error(`Run 'expose dashboard stop' to stop it first`);
+      process.exit(1);
+    } catch (error) {
+      // Process doesn't exist, clean up stale state
+      delete state.dashboard;
+      saveState(state);
+    }
+  }
+
+  if (background) {
+    // Run dashboard in background using Bun.spawn for better detachment
+    const scriptPath = process.argv[1];
+    const logFile = join(LOGS_DIR, 'dashboard.log');
+
+    const dashboardProcess = Bun.spawn(['bun', 'run', scriptPath, 'dashboard', port.toString(), '--foreground'], {
+      stdout: Bun.file(logFile),
+      stderr: Bun.file(logFile),
+      stdin: 'ignore',
+    });
+
+    // Save dashboard state
+    state.dashboard = {
+      pid: dashboardProcess.pid,
+      port,
+      started: new Date().toISOString(),
+    };
+    saveState(state);
+
+    console.log(JSON.stringify({
+      status: 'started',
+      url: `http://localhost:${port}`,
+      pid: dashboardProcess.pid,
+      logFile,
+    }, null, 2));
+
+    // Exit parent process so dashboard runs independently
+    process.exit(0);
+  }
+
+  // Foreground mode
   console.error(`Starting expose dashboard on http://localhost:${port}`);
   console.error('Press Ctrl+C to stop');
 
@@ -1158,8 +1210,8 @@ function startDashboard(port: number): void {
 
       // API endpoints
       if (url.pathname === '/api/status') {
-        const state = loadState();
-        return new Response(JSON.stringify(state), {
+        const currentState = loadState();
+        return new Response(JSON.stringify(currentState), {
           headers: { 'Content-Type': 'application/json' },
         });
       }
@@ -1180,8 +1232,8 @@ function startDashboard(port: number): void {
       }
 
       // Dashboard HTML
-      const state = loadState();
-      const html = generateDashboardHTML(state);
+      const currentState = loadState();
+      const html = generateDashboardHTML(currentState);
       return new Response(html, {
         headers: { 'Content-Type': 'text/html' },
       });
@@ -1190,9 +1242,39 @@ function startDashboard(port: number): void {
 
   // Keep process running
   process.on('SIGINT', () => {
+    // Clean up dashboard state on exit
+    const exitState = loadState();
+    delete exitState.dashboard;
+    saveState(exitState);
     console.error('\nDashboard stopped');
     process.exit(0);
   });
+}
+
+/**
+ * Stop the web dashboard
+ */
+function stopDashboard(): void {
+  const state = loadState();
+
+  if (!state.dashboard?.pid) {
+    console.error('Dashboard is not running');
+    process.exit(1);
+  }
+
+  try {
+    process.kill(state.dashboard.pid, 'SIGTERM');
+    console.error(`Stopped dashboard (PID ${state.dashboard.pid})`);
+  } catch (error) {
+    console.error(`Warning: Failed to kill dashboard process (might already be stopped)`);
+  }
+
+  delete state.dashboard;
+  saveState(state);
+
+  console.log(JSON.stringify({
+    status: 'stopped',
+  }, null, 2));
 }
 
 // ============================================================================
@@ -1274,7 +1356,8 @@ USAGE:
   expose list                           List all running servers
   expose status                         Show tunnel and server status
   expose logs <name>                    View logs for a server
-  expose dashboard [port]               Start web UI (default: 8080)
+  expose dashboard [port] [-d]          Start web UI (default: 8080)
+  expose dashboard stop                 Stop the dashboard
   expose config                         Show current configuration
   expose help, --help, -h               Show this help message
   expose version, --version, -v         Show version information
@@ -1282,6 +1365,7 @@ USAGE:
 OPTIONS:
   --port <port>                         Expose an existing service on this port
   --dedicated                           Create dedicated tunnel (not shared)
+  -d, --background                      Run dashboard in background
 
 HOSTNAME FORMAT:
   <name> can be a simple subdomain or a full hostname:
@@ -1482,8 +1566,31 @@ async function main() {
 
     case 'dashboard':
     case 'ui': {
-      const port = args[1] ? parseInt(args[1]) : 8080;
-      startDashboard(port);
+      // Handle 'dashboard stop'
+      if (args[1] === 'stop') {
+        stopDashboard();
+        break;
+      }
+
+      // Parse port (first non-flag argument after 'dashboard')
+      let port = 8080;
+      for (let i = 1; i < args.length; i++) {
+        if (!args[i].startsWith('-')) {
+          const parsed = parseInt(args[i]);
+          if (!isNaN(parsed)) {
+            port = parsed;
+            break;
+          }
+        }
+      }
+
+      // Check for background/foreground flags
+      const background = args.includes('--background') || args.includes('-d');
+      const foreground = args.includes('--foreground');
+
+      // --foreground is used internally when spawning background process
+      // If neither flag is set, run in foreground by default (original behavior)
+      startDashboard(port, background && !foreground);
       break;
     }
 
