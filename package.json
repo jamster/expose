@@ -1,0 +1,45 @@
+{
+  "name": "expose-tunnel",
+  "version": "1.0.0",
+  "description": "Expose local directories to the internet via Cloudflare Tunnel with automatic server detection",
+  "type": "module",
+  "bin": {
+    "expose": "./expose.ts"
+  },
+  "files": [
+    "expose.ts",
+    "static-server.ts"
+  ],
+  "scripts": {
+    "start": "bun run expose.ts",
+    "help": "bun run expose.ts --help",
+    "dashboard": "bun run expose.ts dashboard"
+  },
+  "keywords": [
+    "cloudflare",
+    "tunnel",
+    "cloudflared",
+    "local-server",
+    "expose",
+    "publish",
+    "hosting",
+    "development",
+    "devserver",
+    "ngrok-alternative",
+    "localtunnel"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jasonamster/expose.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jasonamster/expose/issues"
+  },
+  "homepage": "https://github.com/jasonamster/expose#readme",
+  "author": "Jason Amster",
+  "license": "MIT",
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "dependencies": {}
+}
