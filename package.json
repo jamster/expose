@@ -30,12 +30,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jasonamster/expose.git"
+    "url": "git+https://github.com/jamster/expose.git"
   },
   "bugs": {
-    "url": "https://github.com/jasonamster/expose/issues"
+    "url": "https://github.com/jamster/expose/issues"
   },
-  "homepage": "https://github.com/jasonamster/expose#readme",
+  "homepage": "https://github.com/jamster/expose#readme",
   "author": "Jason Amster",
   "license": "MIT",
   "engines": {
