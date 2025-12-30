@@ -10,6 +10,7 @@ A clean, deterministic CLI that auto-detects your project type, starts the right
 - **Zero config** - Just run `expose start myapp` and you're live
 - **Secure** - Uses Cloudflare Tunnel (no port forwarding needed)
 - **Your domain** - Publish to your own domain, not random URLs
+- **Multi-domain** - Use your default domain or specify any Cloudflare domain
 - **Web dashboard** - Monitor all exposed services in a browser
 - **JSON output** - Composable with jq, grep, and other tools
 
@@ -93,6 +94,40 @@ Each server gets its own isolated tunnel.
 ```bash
 expose start production --dedicated
 # Creates independent tunnel for production use
+```
+
+## Multi-Domain Support
+
+You can expose projects on different domains without changing your default configuration.
+
+### Default Domain
+Simple names use your configured default domain:
+
+```bash
+expose start demo
+# → https://demo.yourdomain.com
+
+expose start api
+# → https://api.yourdomain.com
+```
+
+### Custom Domain
+Specify a full hostname to use a different domain (must be configured in Cloudflare):
+
+```bash
+expose start test.otherdomain.com
+# → https://test.otherdomain.com
+
+expose start staging.api.company.io
+# → https://staging.api.company.io
+```
+
+### Stopping Multi-Domain Servers
+Stop servers by subdomain or full hostname:
+
+```bash
+expose stop demo                    # stops demo.yourdomain.com
+expose stop test.otherdomain.com    # stops test.otherdomain.com
 ```
 
 ## Configuration

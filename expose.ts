@@ -27,7 +27,8 @@ type ServerType =
   | 'python-app'
   | 'rails'
   | 'sinatra'
-  | 'react';
+  | 'react'
+  | 'external';
 
 type TunnelMode = 'managed' | 'dedicated';
 
@@ -47,8 +48,10 @@ interface State {
     };
   };
   servers: {
-    [subdomain: string]: {
+    [key: string]: {
       subdomain: string;
+      domain: string;
+      hostname: string;
       path: string;
       port: number;
       pid: number;
@@ -59,6 +62,13 @@ interface State {
       started: string;
     };
   };
+}
+
+interface ParsedHostname {
+  subdomain: string;
+  domain: string;
+  hostname: string;
+  key: string;
 }
 
 interface ServerDetectionResult {
@@ -200,6 +210,55 @@ function getNextAvailablePort(state: State): number {
     port++;
   }
   return port;
+}
+
+/**
+ * Parse hostname input into subdomain and domain
+ * Examples:
+ *   "test" -> { subdomain: "test", domain: "jayamster.com", hostname: "test.jayamster.com" }
+ *   "test.fucksafety.com" -> { subdomain: "test", domain: "fucksafety.com", hostname: "test.fucksafety.com" }
+ *   "api.staging.mysite.io" -> { subdomain: "api.staging", domain: "mysite.io", hostname: "api.staging.mysite.io" }
+ */
+function parseHostname(input: string): ParsedHostname {
+  // Check if input contains a dot (indicating a full hostname)
+  const parts = input.split('.');
+
+  if (parts.length === 1) {
+    // Simple subdomain like "test" -> use default domain
+    return {
+      subdomain: input,
+      domain: DOMAIN,
+      hostname: `${input}.${DOMAIN}`,
+      key: input,
+    };
+  }
+
+  if (parts.length === 2) {
+    // Could be "test.com" (domain only) or "sub.domain" (ambiguous)
+    // Treat as subdomain.domain - user wants subdomain on a TLD
+    // e.g., "test.com" -> subdomain: "test", domain: "com" (probably not intended)
+    // More likely: user means "api.mysite" where mysite is shorthand
+    // Let's require at least 3 parts for explicit domain, otherwise use default
+    return {
+      subdomain: input,
+      domain: DOMAIN,
+      hostname: `${input}.${DOMAIN}`,
+      key: input,
+    };
+  }
+
+  // 3+ parts: treat last two as domain, rest as subdomain
+  // e.g., "test.fucksafety.com" -> subdomain: "test", domain: "fucksafety.com"
+  // e.g., "api.staging.mysite.io" -> subdomain: "api.staging", domain: "mysite.io"
+  const domain = parts.slice(-2).join('.');
+  const subdomain = parts.slice(0, -2).join('.');
+
+  return {
+    subdomain,
+    domain,
+    hostname: input,
+    key: input.replace(/\./g, '-'), // Use as state key (dots replaced with dashes)
+  };
 }
 
 // ============================================================================
@@ -423,10 +482,10 @@ function generateTunnelConfig(state: State, tunnelId: string): CloudflareTunnelC
   const ingress: CloudflareTunnelConfig['ingress'] = [];
 
   // Add all active servers
-  for (const [subdomain, server] of Object.entries(state.servers)) {
+  for (const [key, server] of Object.entries(state.servers)) {
     if (server.tunnelMode === 'managed' && server.tunnelName === MANAGED_TUNNEL_NAME) {
       ingress.push({
-        hostname: `${subdomain}.${DOMAIN}`,
+        hostname: server.hostname,
         service: `http://localhost:${server.port}`,
       });
     }
@@ -515,11 +574,9 @@ function restartManagedTunnel(state: State, tunnelId: string): void {
 }
 
 /**
- * Route subdomain to tunnel
+ * Route hostname to tunnel
  */
-function routeSubdomainToDNS(tunnelName: string, subdomain: string, dedicated: boolean = false): void {
-  const hostname = `${subdomain}.${DOMAIN}`;
-
+function routeHostnameToDNS(tunnelName: string, hostname: string): void {
   console.error(`Routing DNS: ${hostname} → ${tunnelName}`);
 
   const result = Bun.spawnSync(['cloudflared', 'tunnel', 'route', 'dns', tunnelName, hostname]);
@@ -534,19 +591,21 @@ function routeSubdomainToDNS(tunnelName: string, subdomain: string, dedicated: b
 // ============================================================================
 
 /**
- * Start a server in the current directory
+ * Start a server in the current directory, or expose an existing service
  */
 function startServer(
-  subdomain: string,
+  hostnameInput: string,
   directory: string,
-  dedicated: boolean
+  dedicated: boolean,
+  externalPort?: number
 ): void {
   const state = loadState();
+  const parsed = parseHostname(hostnameInput);
 
-  // Check if subdomain already exists
-  if (state.servers[subdomain]) {
-    console.error(`Error: Subdomain '${subdomain}' is already in use`);
-    console.error(`Run 'expose stop ${subdomain}' first`);
+  // Check if hostname already exists
+  if (state.servers[parsed.key]) {
+    console.error(`Error: '${parsed.hostname}' is already in use`);
+    console.error(`Run 'expose stop ${hostnameInput}' first`);
     process.exit(1);
   }
 
@@ -557,40 +616,52 @@ function startServer(
     process.exit(1);
   }
 
-  // Get next available port
-  const port = getNextAvailablePort(state);
+  let port: number;
+  let serverType: ServerType;
+  let serverPid: number;
+  const logFile = join(LOGS_DIR, `${parsed.key}.log`);
 
-  // Detect server type
-  console.error(`Detecting server type in ${directory}...`);
-  const detection = detectServerType(directory, port);
-  console.error(`Detected: ${detection.type}`);
+  if (externalPort) {
+    // Expose an existing service running on the specified port
+    port = externalPort;
+    serverType = 'external';
+    serverPid = 0; // We don't manage this process
+    console.error(`Exposing existing service on port ${port}...`);
+  } else {
+    // Get next available port
+    port = getNextAvailablePort(state);
 
-  // Start the server
-  console.error(`Starting ${detection.type} server on port ${port}...`);
-  const logFile = join(LOGS_DIR, `${subdomain}.log`);
+    // Detect server type
+    console.error(`Detecting server type in ${directory}...`);
+    const detection = detectServerType(directory, port);
+    console.error(`Detected: ${detection.type}`);
+    serverType = detection.type;
 
-  const serverProcess = spawn(detection.command, detection.args, {
-    cwd: directory,
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+    // Start the server
+    console.error(`Starting ${detection.type} server on port ${port}...`);
 
-  // Redirect logs
-  const logStream = Bun.file(logFile).writer();
-  serverProcess.stdout?.on('data', (data) => {
-    logStream.write(data);
-  });
-  serverProcess.stderr?.on('data', (data) => {
-    logStream.write(data);
-  });
+    const serverProcess = spawn(detection.command, detection.args, {
+      cwd: directory,
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
 
-  serverProcess.unref();
+    // Redirect logs
+    const logStream = Bun.file(logFile).writer();
+    serverProcess.stdout?.on('data', (data) => {
+      logStream.write(data);
+    });
+    serverProcess.stderr?.on('data', (data) => {
+      logStream.write(data);
+    });
 
-  const serverPid = serverProcess.pid!;
+    serverProcess.unref();
+    serverPid = serverProcess.pid!;
+  }
 
   // Setup tunnel
   const tunnelMode: TunnelMode = dedicated ? 'dedicated' : 'managed';
-  const tunnelName = dedicated ? `${subdomain}-tunnel` : MANAGED_TUNNEL_NAME;
+  const tunnelName = dedicated ? `${parsed.key}-tunnel` : MANAGED_TUNNEL_NAME;
 
   let tunnelId: string;
 
@@ -609,7 +680,7 @@ function startServer(
       'credentials-file': join(homedir(), '.cloudflared', `${tunnelId}.json`),
       ingress: [
         {
-          hostname: `${subdomain}.${DOMAIN}`,
+          hostname: parsed.hostname,
           service: `http://localhost:${port}`,
         },
         {
@@ -618,7 +689,7 @@ function startServer(
       ],
     };
 
-    const dedicatedConfigPath = join(EXPOSE_DIR, `tunnel-${subdomain}.yml`);
+    const dedicatedConfigPath = join(EXPOSE_DIR, `tunnel-${parsed.key}.yml`);
     writeTunnelConfig(dedicatedConfig, dedicatedConfigPath);
 
     const tunnelProcess = spawn('cloudflared', ['tunnel', '--config', dedicatedConfigPath, 'run', tunnelId], {
@@ -635,19 +706,21 @@ function startServer(
       configPath: dedicatedConfigPath,
     };
 
-    routeSubdomainToDNS(tunnelName, subdomain, true);
+    routeHostnameToDNS(tunnelName, parsed.hostname);
   } else {
     // Use managed tunnel
     tunnelId = ensureManagedTunnel(state);
 
     // Add server to state first
-    const url = `https://${subdomain}.${DOMAIN}`;
-    state.servers[subdomain] = {
-      subdomain,
+    const url = `https://${parsed.hostname}`;
+    state.servers[parsed.key] = {
+      subdomain: parsed.subdomain,
+      domain: parsed.domain,
+      hostname: parsed.hostname,
       path: directory,
       port,
       pid: serverPid,
-      serverType: detection.type,
+      serverType,
       tunnelMode,
       tunnelName,
       url,
@@ -658,18 +731,20 @@ function startServer(
     restartManagedTunnel(state, tunnelId);
 
     // Route DNS
-    routeSubdomainToDNS(tunnelName, subdomain, false);
+    routeHostnameToDNS(tunnelName, parsed.hostname);
   }
 
   // Save final state
-  const url = `https://${subdomain}.${DOMAIN}`;
+  const url = `https://${parsed.hostname}`;
 
-  state.servers[subdomain] = {
-    subdomain,
+  state.servers[parsed.key] = {
+    subdomain: parsed.subdomain,
+    domain: parsed.domain,
+    hostname: parsed.hostname,
     path: directory,
     port,
     pid: serverPid,
-    serverType: detection.type,
+    serverType,
     tunnelMode,
     tunnelName,
     url,
@@ -679,37 +754,71 @@ function startServer(
   saveState(state);
 
   console.log(JSON.stringify({
-    subdomain,
+    hostname: parsed.hostname,
     url,
     port,
-    type: detection.type,
+    type: serverType,
     tunnelMode,
-    logFile,
+    ...(serverType !== 'external' ? { logFile } : {}),
   }, null, 2));
+}
+
+/**
+ * Find server by input (can be key, hostname, or subdomain)
+ */
+function findServerKey(state: State, input: string): string | null {
+  const parsed = parseHostname(input);
+
+  // Try exact key match first
+  if (state.servers[parsed.key]) {
+    return parsed.key;
+  }
+
+  // Try finding by hostname
+  for (const [key, server] of Object.entries(state.servers)) {
+    if (server.hostname === parsed.hostname || server.hostname === input) {
+      return key;
+    }
+  }
+
+  // Try finding by subdomain (for backward compatibility)
+  for (const [key, server] of Object.entries(state.servers)) {
+    if (server.subdomain === input || key === input) {
+      return key;
+    }
+  }
+
+  return null;
 }
 
 /**
  * Stop a running server
  */
-function stopServer(subdomain: string): void {
+function stopServer(hostnameInput: string): void {
   const state = loadState();
 
-  const server = state.servers[subdomain];
-  if (!server) {
-    console.error(`Error: No server found for subdomain '${subdomain}'`);
+  const serverKey = findServerKey(state, hostnameInput);
+  if (!serverKey) {
+    console.error(`Error: No server found for '${hostnameInput}'`);
     process.exit(1);
   }
 
-  // Stop the server process
-  try {
-    process.kill(server.pid, 'SIGTERM');
-    console.error(`Stopped server: ${subdomain} (PID ${server.pid})`);
-  } catch (error) {
-    console.error(`Warning: Failed to kill process ${server.pid} (might already be dead)`);
+  const server = state.servers[serverKey];
+
+  // Stop the server process (skip for external services)
+  if (server.pid && server.pid > 0) {
+    try {
+      process.kill(server.pid, 'SIGTERM');
+      console.error(`Stopped server: ${server.hostname} (PID ${server.pid})`);
+    } catch (error) {
+      console.error(`Warning: Failed to kill process ${server.pid} (might already be dead)`);
+    }
+  } else {
+    console.error(`Removing tunnel for external service: ${server.hostname}`);
   }
 
   // Remove from state
-  delete state.servers[subdomain];
+  delete state.servers[serverKey];
 
   // If using dedicated tunnel, stop it
   if (server.tunnelMode === 'dedicated') {
@@ -734,7 +843,7 @@ function stopServer(subdomain: string): void {
   saveState(state);
 
   console.log(JSON.stringify({
-    subdomain,
+    hostname: server.hostname,
     status: 'stopped',
   }, null, 2));
 }
@@ -912,6 +1021,7 @@ function generateDashboardHTML(state: State): string {
     .badge-sinatra { background: #1e2a3a; color: #999; }
     .badge-python-app { background: #2d3a1e; color: #ffd43b; }
     .badge-python-http { background: #2d3a1e; color: #ffd43b; }
+    .badge-external { background: #3a2d1e; color: #f97316; }
     .badge-mode { background: #2d1e3a; color: #a855f7; }
     .btn {
       padding: 0.5rem 1rem;
@@ -1158,22 +1268,34 @@ A clean, deterministic CLI for instantly publishing local directories
 with automatic server detection and Cloudflare Tunnel routing.
 
 USAGE:
-  expose init <domain>                  Configure your domain (first-time setup)
-  expose start <subdomain> [options]    Start serving current directory
-  expose stop <subdomain>               Stop a running server
+  expose init <domain>                  Configure your default domain (first-time setup)
+  expose start <name> [options]         Start serving current directory
+  expose stop <name>                    Stop a running server
   expose list                           List all running servers
   expose status                         Show tunnel and server status
-  expose logs <subdomain>               View logs for a server
+  expose logs <name>                    View logs for a server
   expose dashboard [port]               Start web UI (default: 8080)
   expose config                         Show current configuration
   expose help, --help, -h               Show this help message
   expose version, --version, -v         Show version information
 
 OPTIONS:
+  --port <port>                         Expose an existing service on this port
   --dedicated                           Create dedicated tunnel (not shared)
 
+HOSTNAME FORMAT:
+  <name> can be a simple subdomain or a full hostname:
+
+  Simple subdomain (uses default domain):
+    expose start demo              → https://demo.${DOMAIN}
+    expose start api               → https://api.${DOMAIN}
+
+  Full hostname (uses specified domain):
+    expose start test.other.com    → https://test.other.com
+    expose start api.staging.io    → https://api.staging.io
+
 FIRST-TIME SETUP:
-  # Configure your Cloudflare domain
+  # Configure your default Cloudflare domain
   expose init mydomain.com
 
   # Or use environment variables
@@ -1182,17 +1304,24 @@ FIRST-TIME SETUP:
   export EXPOSE_BASE_PORT=3000          # optional
 
 EXAMPLES:
-  # Start serving current directory at demo.${DOMAIN}
-  expose start demo
+  # Using default domain (${DOMAIN}):
+  expose start demo                     → https://demo.${DOMAIN}
+  expose start myapp --dedicated        → https://myapp.${DOMAIN}
 
-  # Start with dedicated tunnel at myapp.${DOMAIN}
-  expose start myapp --dedicated
+  # Using a different domain:
+  expose start test.other.com           → https://test.other.com
+  expose start api.staging.site.io      → https://api.staging.site.io
+
+  # Expose an existing service (Docker, etc.):
+  expose start ntfy --port 8090         → https://ntfy.${DOMAIN}
+  expose start db.internal.io --port 5432
 
   # List all running servers
   expose list
 
-  # Stop a server
+  # Stop a server (by subdomain or full hostname)
   expose stop demo
+  expose stop test.other.com
 
   # View logs
   expose logs demo
@@ -1216,12 +1345,12 @@ SERVER TYPES (Auto-detected):
 
 TUNNEL MODES:
   - Managed (default): All servers share one tunnel
-    Subdomains: <name>.${DOMAIN}
+    Hostname: <name>.${DOMAIN} or custom domain
     One tunnel process handles all servers
     Easy to manage, efficient
 
   - Dedicated (--dedicated flag): Each server gets its own tunnel
-    Subdomains: <name>.${DOMAIN}
+    Hostname: <name>.${DOMAIN} or custom domain
     Independent tunnel process per server
     Better for production or distributed setups
 
@@ -1234,14 +1363,14 @@ CONFIGURATION:
 REQUIREMENTS:
   - Bun runtime (https://bun.sh)
   - cloudflared installed and authenticated
-  - Cloudflare domain configured
+  - Cloudflare domain(s) configured in Cloudflare
 
 INSTALL:
   # Via bun (recommended)
   bun add -g expose-tunnel
 
   # Or clone and link
-  git clone https://github.com/YOUR_USERNAME/expose.git
+  git clone https://github.com/jamster/expose.git
   cd expose && bun link
 
 Version: 1.0.0
@@ -1294,15 +1423,26 @@ async function main() {
 
       const subdomain = args[1];
       if (!subdomain) {
-        console.error('Error: subdomain is required');
-        console.error('Usage: expose start <subdomain> [--dedicated]');
+        console.error('Error: name is required');
+        console.error('Usage: expose start <name> [--port <port>] [--dedicated]');
         process.exit(1);
       }
 
       const dedicated = args.includes('--dedicated');
       const directory = process.cwd();
 
-      startServer(subdomain, directory, dedicated);
+      // Parse --port flag
+      const portIndex = args.indexOf('--port');
+      let externalPort: number | undefined;
+      if (portIndex !== -1 && args[portIndex + 1]) {
+        externalPort = parseInt(args[portIndex + 1]);
+        if (isNaN(externalPort) || externalPort < 1 || externalPort > 65535) {
+          console.error('Error: Invalid port number');
+          process.exit(1);
+        }
+      }
+
+      startServer(subdomain, directory, dedicated, externalPort);
       break;
     }
 
